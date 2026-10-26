@@ -204,6 +204,31 @@ class Manifest:
 
         self._queue = [x for x in self._queue if x.func.default]
 
+    def filter_by_last_failed(self, failed_selectors: Iterable[str]) -> None:
+        """Filter the queue down to sessions that failed or aborted previously.
+
+        Used by ``--last-failed`` to re-select sessions from a previous
+        ``--report``. Selectors are fully-qualified session signatures (e.g.
+        ``test-3.12(x=1)``) so a single parametrization can be selected
+        without pulling in its siblings.
+
+        Unlike :meth:`filter_by_name`, a selector that matches no current
+        session is silently ignored: sessions removed from the Noxfile since
+        the report was written simply drop out.
+
+        Args:
+            failed_selectors (Sequence[str]): Identifiers of the previously
+                failed or aborted sessions, taken from the report.
+        """
+        self._queue = [
+            session
+            for session in self._queue
+            if any(
+                _normalized_session_match(selector, session)
+                for selector in failed_selectors
+            )
+        ]
+
     def filter_by_python_interpreter(self, specified_pythons: Sequence[str]) -> None:
         """Filter sessions in the queue based on the user-specified
         python interpreter versions.

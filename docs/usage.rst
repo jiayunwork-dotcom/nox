@@ -548,6 +548,41 @@ You can output a report in ``json`` format by specifying ``--report``:
     nox --report status.json
 
 
+.. _opt-last-failed:
+
+Re-running only failed sessions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When you already write a ``--report``, you can pass ``--last-failed`` to read
+that report and re-run only the sessions whose result was ``failed`` or
+``aborted``; successful and skipped sessions are left alone:
+
+.. code-block:: console
+
+    nox --last-failed --report status.json
+
+The report file is read *and* rewritten in place, so you can repeat the
+command until everything passes. Any sessions the failed sessions require are
+still run first, as usual. For a parametrized session, only the failing
+parameter combinations are re-run; sessions marked ``default=False`` are
+re-run too if they failed. Sessions present in the report but no longer in
+the Noxfile are ignored.
+
+``--last-failed`` can be combined with ``-s``/``--session``, ``-k``/``--keywords``
+and ``-t``/``--tags``; the selections are intersected. With
+``--list-sessions`` only the re-run sessions are marked selected, and with
+``--parallel`` only they are run in parallel. A previously failed session
+that is excluded by another selector is not run this time, but its old record
+is kept at the end of the rewritten report so a later ``--last-failed`` can
+still find it; the overall report result reflects only the sessions that ran.
+
+If the report contains no failed or aborted sessions, no sessions run and Nox
+exits successfully without modifying the report. ``--last-failed`` requires
+``--report``; if the option is missing, the file does not exist, or the file
+is not a Nox report, Nox reports an error and exits non-zero without running
+anything or altering the file.
+
+
 Converting from tox
 -------------------
 

@@ -342,6 +342,20 @@ def test_parallel_worker_is_internal() -> None:
     assert "--parallel-worker" not in _options.options.parser().format_help()
 
 
+def test_child_argv_disables_last_failed() -> None:
+    # --last-failed belongs to the parent, which already selected the
+    # sessions; a child must not try to read its fresh temp report.
+    config = _options.options.namespace(last_failed=True, report="previous.json")
+    argv = _parallel._child_argv(
+        config, _fake_runner(FakeSession("tests")), "child.json"
+    )
+
+    assert "--last-failed" not in argv
+    child_config = _options.options.parse_args(argv[3:])
+    assert child_config.last_failed is False
+    assert argv[argv.index("--report") + 1] == "child.json"
+
+
 @pytest.mark.parametrize(
     ("args", "allow_parallel", "expected"),
     [

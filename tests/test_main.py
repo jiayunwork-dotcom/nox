@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import shutil
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from unittest import mock
 
+import attrs
 import pytest
 
 import nox
@@ -1263,3 +1265,257 @@ def test_noxfile_script_mode_url_req(tmp_path: Path) -> None:
     assert job.returncode == 0
     # Newer hatchling keeps the tag as written, older versions normalize it
     assert job.stdout.rstrip() in {"2024.10.9", "2024.10.09"}
+
+
+@pytest.fixture
+def reset_noxfile_options() -> None:
+    """Reset the global ``nox.options`` singleton for in-process runs.
+
+    Noxfiles assign to ``nox.options`` (e.g. ``nox.options.sessions``); the
+    singleton survives between ``nox.main()`` calls in the same process, so
+    assignments from an earlier test's Noxfile can leak into a later run.
+    """
+    singleton = nox._options.noxfile_options
+    defaults = type(singleton)()
+    for field in attrs.fields(type(singleton)):
+        if not field.name.startswith("_"):
+            setattr(singleton, field.name, getattr(defaults, field.name))
+    singleton._provenance.clear()
+
+
+# ---------------------------------------------------------------------------
+# --last-failed
+# ---------------------------------------------------------------------------
+
+_LAST_FAILED_NOXFILE = """\
+from pathlib import Path
+
+import nox
+
+
+@nox.session(venv_backend="none")
+def good(session):
+    session.log("good ran")
+
+
+@nox.session(venv_backend="none")
+@nox.parametrize("x", [1, 2])
+def tests(session, x):
+    if x == 2 and not Path("fix.flag").exists():
+        raise RuntimeError("failing on x=2")
+
+
+@nox.session(venv_backend="none")
+def lint(session):
+    if not Path("fix.flag").exists():
+        raise RuntimeError("lint failure")
+
+
+@nox.session(venv_backend="none", default=False)
+def optional(session):
+    raise RuntimeError("optional failure")
+"""
+
+
+def _write_last_failed_noxfile(tmp_path: Path) -> Path:
+    noxfile = tmp_path / "noxfile_last_failed.py"
+    noxfile.write_text(_LAST_FAILED_NOXFILE, encoding="utf-8")
+    return noxfile
+
+
+def _report_entries(path: Path) -> list[tuple[list[str], str]]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return [(entry["signatures"], entry["result"]) for entry in data["sessions"]]
+
+
+@pytest.mark.usefixtures("reset_noxfile_options")
+def test_main_last_failed_rerun_cycle(
+    tmp_path: Path,
+    run_nox: Callable[..., tuple[int, str, str]],
+) -> None:
+    noxfile = _write_last_failed_noxfile(tmp_path)
+    report = tmp_path / "report.json"
+
+    # First (full) run: good and tests(x=1) pass, tests(x=2) and lint fail.
+    returncode, _, _ = run_nox("-f", str(noxfile), "--report", str(report))
+    assert returncode == 1
+    data = json.loads(report.read_text(encoding="utf-8"))
+    assert data["result"] == 0
+    assert _report_entries(report) == [
+        (["good"], "success"),
+        (["tests(x=1)"], "success"),
+        (["tests(x=2)"], "failed"),
+        (["lint"], "failed"),
+    ]
+
+    # --last-failed reruns only the failures, not the successes.
+    returncode, _, stderr = run_nox(
+        "-f", str(noxfile), "--last-failed", "--report", str(report)
+    )
+    assert returncode == 1
+    assert "Running session tests(x=2)" in stderr
+    assert "Running session lint" in stderr
+    assert "Running session tests(x=1)" not in stderr
+    assert "Running session good" not in stderr
+    assert _report_entries(report) == [
+        (["tests(x=2)"], "failed"),
+        (["lint"], "failed"),
+    ]
+
+    # -s intersects: tests(x=2) runs again, lint is excluded but its old
+    # record is carried to the rewritten report.
+    returncode, _, _ = run_nox(
+        "-f",
+        str(noxfile),
+        "--last-failed",
+        "-s",
+        "tests",
+        "--report",
+        str(report),
+    )
+    assert returncode == 1
+    assert _report_entries(report) == [
+        (["tests(x=2)"], "failed"),
+        (["lint"], "failed"),
+    ]
+
+    # The retained lint failure is picked up by a plain --last-failed again.
+    returncode, _, stderr = run_nox(
+        "-f", str(noxfile), "--last-failed", "--report", str(report)
+    )
+    assert returncode == 1
+    assert "Running session tests(x=2)" in stderr
+    assert "Running session lint" in stderr
+
+    # Fix the problem: both reruns pass, old successes stay gone.
+    (tmp_path / "fix.flag").write_text("", encoding="utf-8")
+    returncode, _, _ = run_nox(
+        "-f", str(noxfile), "--last-failed", "--report", str(report)
+    )
+    assert returncode == 0
+    data = json.loads(report.read_text(encoding="utf-8"))
+    assert data["result"] == 1
+    assert _report_entries(report) == [
+        (["tests(x=2)"], "success"),
+        (["lint"], "success"),
+    ]
+
+    # Nothing failed: nothing runs, exit 0, report left byte-for-byte intact.
+    before = report.read_bytes()
+    returncode, _, stderr = run_nox(
+        "-f", str(noxfile), "--last-failed", "--report", str(report)
+    )
+    assert returncode == 0
+    assert "Running session" not in stderr
+    assert report.read_bytes() == before
+
+
+@pytest.mark.usefixtures("reset_noxfile_options")
+def test_main_last_failed_reruns_default_false(
+    tmp_path: Path,
+    run_nox: Callable[..., tuple[int, str, str]],
+) -> None:
+    noxfile = _write_last_failed_noxfile(tmp_path)
+    report = tmp_path / "optional.json"
+
+    returncode, _, _ = run_nox(
+        "-f", str(noxfile), "-s", "optional", "--report", str(report)
+    )
+    assert returncode == 1
+
+    # A default=False session that failed is still rerun by --last-failed.
+    returncode, _, stderr = run_nox(
+        "-f", str(noxfile), "--last-failed", "--report", str(report)
+    )
+    assert returncode == 1
+    assert "Running session optional" in stderr
+    assert _report_entries(report) == [(["optional"], "failed")]
+
+
+@pytest.mark.usefixtures("reset_noxfile_options")
+def test_main_last_failed_bad_reports(
+    tmp_path: Path,
+    run_nox: Callable[..., tuple[int, str, str]],
+) -> None:
+    noxfile = _write_last_failed_noxfile(tmp_path)
+
+    # --last-failed without --report.
+    returncode, _, stderr = run_nox("-f", str(noxfile), "--last-failed")
+    assert returncode != 0
+    assert "requires --report" in stderr
+
+    # Missing report file; it must not be created.
+    missing = tmp_path / "missing.json"
+    returncode, _, stderr = run_nox(
+        "-f", str(noxfile), "--last-failed", "--report", str(missing)
+    )
+    assert returncode != 0
+    assert "report file not found" in stderr
+    assert not missing.exists()
+
+    # Malformed report: error, non-zero exit, file untouched.
+    bad = tmp_path / "bad.json"
+    bad.write_text("definitely not json", encoding="utf-8")
+    returncode, _, _ = run_nox(
+        "-f", str(noxfile), "--last-failed", "--report", str(bad)
+    )
+    assert returncode != 0
+    assert bad.read_text(encoding="utf-8") == "definitely not json"
+
+
+@pytest.mark.usefixtures("reset_noxfile_options")
+def test_main_last_failed_list_sessions(
+    tmp_path: Path,
+    run_nox: Callable[..., tuple[int, str, str]],
+) -> None:
+    noxfile = _write_last_failed_noxfile(tmp_path)
+    report = tmp_path / "report.json"
+    returncode, _, _ = run_nox("-f", str(noxfile), "--report", str(report))
+    assert returncode == 1
+
+    before = report.read_bytes()
+    returncode, stdout, _ = run_nox(
+        "-f",
+        str(noxfile),
+        "--last-failed",
+        "--report",
+        str(report),
+        "--list-sessions",
+    )
+    assert returncode == 0
+    assert "- good" in stdout
+    assert "- tests(x=1)" in stdout
+    assert "* tests(x=2)" in stdout
+    assert "* lint" in stdout
+    assert "- optional" in stdout
+    # Listing must not rewrite the report file.
+    assert report.read_bytes() == before
+
+
+@pytest.mark.usefixtures("reset_noxfile_options")
+def test_main_last_failed_parallel(
+    tmp_path: Path,
+    run_nox: Callable[..., tuple[int, str, str]],
+) -> None:
+    noxfile = _write_last_failed_noxfile(tmp_path)
+    report = tmp_path / "report.json"
+
+    returncode, _, _ = run_nox("-f", str(noxfile), "--report", str(report))
+    assert returncode == 1
+
+    returncode, _, _ = run_nox(
+        "-f",
+        str(noxfile),
+        "--last-failed",
+        "--parallel",
+        "2",
+        "--allow-parallel",
+        "--report",
+        str(report),
+    )
+    assert returncode == 1
+    # Only the two failing sessions were executed as parallel children.
+    assert _report_entries(report) == [
+        (["tests(x=2)"], "failed"),
+        (["lint"], "failed"),
+    ]

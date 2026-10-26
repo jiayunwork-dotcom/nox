@@ -270,6 +270,19 @@ class NoxfileOptions(_option_set.OptionsBase):
             help="Only run sessions that match the given expression.",
         ),
     )
+    last_failed: bool = attrs.field(
+        default=False,
+        validator=av_bool,
+        metadata=opt(
+            "--last-failed",
+            group="sessions",
+            help=(
+                "Re-run only the sessions that failed or aborted in the previous"
+                " --report run. Requires --report: that file is read to select"
+                " sessions and rewritten with this run's results."
+            ),
+        ),
+    )
     parallel: int | None = attrs.field(
         default=None,
         converter=_parallel_converter,
@@ -633,6 +646,16 @@ class NoxConfig(NoxfileOptions):
     # Wall-clock duration of a parallel run, recorded by the parallel runner
     # so the summary reports elapsed time, not the sum of session durations.
     parallel_wall_time: float | None = attrs.field(
+        default=None, metadata=opt(hidden=True, forward=Forward.NEVER)
+    )
+    # --last-failed internal state: the parsed entries of the previous
+    # --report file, and the selectors that still match sessions in the current
+    # Noxfile. Populated by filter_manifest and consumed by create_report.
+    # Never exposed on the CLI or forwarded to --parallel children.
+    last_failed_entries: list[dict[str, Any]] | None = attrs.field(
+        default=None, metadata=opt(hidden=True, forward=Forward.NEVER)
+    )
+    last_failed_known_selectors: frozenset[str] | None = attrs.field(
         default=None, metadata=opt(hidden=True, forward=Forward.NEVER)
     )
     # The original working directory that Nox was invoked from, since it could

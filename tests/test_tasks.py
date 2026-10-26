@@ -893,6 +893,458 @@ def test_create_report() -> None:
         open_.assert_called_once_with("/path/to/report", "w", encoding="utf-8")
 
 
+# ---------------------------------------------------------------------------
+# --last-failed
+# ---------------------------------------------------------------------------
+
+_REPORT_RESULT_CODES = {
+    "success": 1,
+    "skipped": 2,
+    "failed": 0,
+    "aborted": -1,
+}
+
+
+def _report_session_entry(
+    name: str,
+    status: str,
+    signatures: list[str] | None = None,
+    **extra: object,
+) -> dict[str, typing.Any]:
+    entry: dict[str, typing.Any] = {
+        "args": {},
+        "name": name,
+        "result": status,
+        "result_code": _REPORT_RESULT_CODES[status],
+        "reason": None,
+        "signatures": [name] if signatures is None else signatures,
+        "duration": 0.0,
+    }
+    entry.update(extra)
+    return entry
+
+
+def _write_report(
+    tmp_path: Path,
+    entries: list[dict[str, typing.Any]],
+    *,
+    filename: str = "report.json",
+) -> Path:
+    path = tmp_path / filename
+    overall = int(all(entry["result_code"] > 0 for entry in entries))
+    path.write_text(
+        json.dumps({"result": overall, "sessions": entries}), encoding="utf-8"
+    )
+    return path
+
+
+def _last_failed_config(path: Path, **kwargs: object) -> _options.NoxConfig:
+    kwargs.setdefault("sessions", None)
+    kwargs.setdefault("pythons", ())
+    kwargs.setdefault("keywords", None)
+    kwargs.setdefault("tags", None)
+    kwargs.setdefault("posargs", [])
+    return _options.options.namespace(last_failed=True, report=str(path), **kwargs)
+
+
+def _queued_names(manifest: Manifest) -> list[str]:
+    return [
+        session.friendly_name
+        for session, selected in manifest.list_all_sessions()
+        if selected
+    ]
+
+
+def test_last_failed_requires_report(caplog: pytest.LogCaptureFixture) -> None:
+    config = _options.options.namespace(last_failed=True, report=None)
+    manifest = Manifest({"foo": session_func}, config)
+    assert tasks.filter_manifest(manifest, config) == 3
+    assert "--last-failed requires --report" in caplog.text
+
+
+def test_last_failed_missing_report(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    missing = tmp_path / "nope.json"
+    config = _last_failed_config(missing)
+    manifest = Manifest({"foo": session_func}, config)
+    assert tasks.filter_manifest(manifest, config) == 3
+    assert "report file not found" in caplog.text
+
+
+def test_last_failed_invalid_json_leaves_file_alone(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "report.json"
+    path.write_text("this is not json", encoding="utf-8")
+    config = _last_failed_config(path)
+    manifest = Manifest({"foo": session_func}, config)
+    assert tasks.filter_manifest(manifest, config) == 3
+    assert "is not a Nox report" in caplog.text
+    assert path.read_text(encoding="utf-8") == "this is not json"
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "[]",
+        '{"foo": 1}',
+        '{"sessions": "all of them"}',
+        '{"sessions": [{"result": "exploded"}]}',
+        '{"sessions": [{"name": "foo"}]}',
+        '{"sessions": [42]}',
+    ],
+)
+def test_last_failed_rejects_non_nox_reports(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, contents: str
+) -> None:
+    path = tmp_path / "report.json"
+    path.write_text(contents, encoding="utf-8")
+    config = _last_failed_config(path)
+    manifest = Manifest({"foo": session_func}, config)
+    assert tasks.filter_manifest(manifest, config) == 3
+    assert "is not a Nox report" in caplog.text
+    assert path.read_text(encoding="utf-8") == contents
+
+
+def test_last_failed_selects_only_failed_and_aborted(tmp_path: Path) -> None:
+    path = _write_report(
+        tmp_path,
+        [
+            _report_session_entry("foo", "success"),
+            _report_session_entry("bar", "failed"),
+            _report_session_entry("baz", "aborted"),
+            _report_session_entry("qux", "skipped"),
+        ],
+    )
+    config = _last_failed_config(path)
+    manifest = Manifest(
+        dict.fromkeys(("foo", "bar", "baz", "qux"), session_func), config
+    )
+
+    assert tasks.filter_manifest(manifest, config) is manifest
+    assert _queued_names(manifest) == ["bar", "baz"]
+    assert config.last_failed_known_selectors == frozenset({"bar", "baz"})
+    assert config.last_failed_entries is not None
+    assert [entry["name"] for entry in config.last_failed_entries] == [
+        "foo",
+        "bar",
+        "baz",
+        "qux",
+    ]
+
+
+def test_last_failed_ignores_sessions_removed_from_noxfile(
+    tmp_path: Path,
+) -> None:
+    path = _write_report(
+        tmp_path,
+        [
+            _report_session_entry("bar", "failed"),
+            _report_session_entry("ghost", "failed"),
+        ],
+    )
+    config = _last_failed_config(path)
+    manifest = Manifest({"bar": session_func}, config)
+
+    assert tasks.filter_manifest(manifest, config) is manifest
+    assert _queued_names(manifest) == ["bar"]
+    # The ghost is not considered "known", so it won't be carried forward.
+    assert config.last_failed_known_selectors == frozenset({"bar"})
+
+
+def test_last_failed_reruns_default_false_sessions(tmp_path: Path) -> None:
+    @nox.session(default=False)
+    def optional() -> None:
+        pass
+
+    path = _write_report(tmp_path, [_report_session_entry("optional", "failed")])
+    config = _last_failed_config(path)
+    manifest = Manifest({"optional": optional}, config)
+
+    assert tasks.filter_manifest(manifest, config) is manifest
+    assert _queued_names(manifest) == ["optional"]
+
+
+def test_last_failed_reruns_only_failed_parametrization(tmp_path: Path) -> None:
+    @nox.session
+    @nox.parametrize("django", ["1.9", "2.0"])
+    def tests(session: object, django: str) -> None:
+        pass
+
+    path = _write_report(
+        tmp_path,
+        [
+            _report_session_entry(
+                "tests",
+                "success",
+                signatures=["tests(django='1.9')"],
+                args={"django": "1.9"},
+            ),
+            _report_session_entry(
+                "tests",
+                "failed",
+                signatures=["tests(django='2.0')"],
+                args={"django": "2.0"},
+            ),
+        ],
+    )
+    config = _last_failed_config(path)
+    manifest = Manifest({"tests": tests}, config)
+
+    assert tasks.filter_manifest(manifest, config) is manifest
+    assert _queued_names(manifest) == ["tests(django='2.0')"]
+
+
+def test_last_failed_adds_requires_prerequisites(tmp_path: Path) -> None:
+    pre = _make_session_func([])
+    build = _make_session_func(["pre"])
+
+    path = _write_report(
+        tmp_path,
+        [
+            _report_session_entry("pre", "success"),
+            _report_session_entry("build", "failed"),
+        ],
+    )
+    config = _last_failed_config(path)
+    manifest = Manifest({"pre": pre, "build": build}, config)
+
+    assert tasks.filter_manifest(manifest, config) is manifest
+    # The successful prerequisite is pulled in anyway, ordered before build.
+    assert _queued_names(manifest) == ["pre", "build"]
+
+
+def test_last_failed_intersects_sessions(tmp_path: Path) -> None:
+    path = _write_report(
+        tmp_path,
+        [
+            _report_session_entry("bar", "failed"),
+            _report_session_entry("baz", "failed"),
+        ],
+    )
+    config = _last_failed_config(path, sessions=("bar",))
+    manifest = Manifest({"bar": session_func, "baz": session_func}, config)
+
+    assert tasks.filter_manifest(manifest, config) is manifest
+    assert _queued_names(manifest) == ["bar"]
+
+
+def test_last_failed_intersect_sessions_not_found(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _write_report(tmp_path, [_report_session_entry("bar", "failed")])
+    config = _last_failed_config(path, sessions=("nope",))
+    manifest = Manifest({"bar": session_func}, config)
+
+    assert tasks.filter_manifest(manifest, config) == 3
+    assert "Sessions not found: nope" in caplog.text
+
+
+def test_last_failed_intersects_keywords(tmp_path: Path) -> None:
+    path = _write_report(
+        tmp_path,
+        [
+            _report_session_entry("bar", "failed"),
+            _report_session_entry("baz", "failed"),
+        ],
+    )
+    config = _last_failed_config(path, keywords="bar")
+    manifest = Manifest({"bar": session_func, "baz": session_func}, config)
+
+    assert tasks.filter_manifest(manifest, config) is manifest
+    assert _queued_names(manifest) == ["bar"]
+
+
+def test_last_failed_intersects_tags(tmp_path: Path) -> None:
+    @nox.session(tags=["a"])
+    def bar() -> None:
+        pass
+
+    @nox.session(tags=["b"])
+    def baz() -> None:
+        pass
+
+    path = _write_report(
+        tmp_path,
+        [
+            _report_session_entry("bar", "failed"),
+            _report_session_entry("baz", "failed"),
+        ],
+    )
+    config = _last_failed_config(path, tags=["a"])
+    manifest = Manifest({"bar": bar, "baz": baz}, config)
+
+    assert tasks.filter_manifest(manifest, config) is manifest
+    assert _queued_names(manifest) == ["bar"]
+
+
+def test_last_failed_no_failures_runs_nothing_and_keeps_report(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _write_report(
+        tmp_path,
+        [
+            _report_session_entry("foo", "success"),
+            _report_session_entry("bar", "skipped"),
+        ],
+    )
+    before = path.read_bytes()
+    config = _last_failed_config(path)
+    manifest = Manifest({"foo": session_func, "bar": session_func}, config)
+
+    assert tasks.filter_manifest(manifest, config) == 0
+    assert "No failed or aborted sessions" in caplog.text
+    assert path.read_bytes() == before
+
+
+def test_last_failed_list_sessions_only_marks_failures(tmp_path: Path) -> None:
+    path = _write_report(
+        tmp_path,
+        [
+            _report_session_entry("foo", "success"),
+            _report_session_entry("bar", "failed"),
+        ],
+    )
+    config = _last_failed_config(path, list_sessions=True)
+    manifest = Manifest({"foo": session_func, "bar": session_func}, config)
+
+    assert tasks.filter_manifest(manifest, config) is manifest
+    assert _queued_names(manifest) == ["bar"]
+
+
+def _last_failed_parametrized_func() -> nox._decorators.Func:
+    @nox.session
+    @nox.parametrize("x", [1, 2])
+    def tests(session: object, x: int) -> None:
+        pass
+
+    return typing.cast("nox._decorators.Func", tests)
+
+
+def test_last_failed_create_report_replaces_runs_and_carries_excluded(
+    tmp_path: Path,
+) -> None:
+    tests = _last_failed_parametrized_func()
+    lint = _make_session_func([])
+    tidy = _make_session_func([])
+
+    path = _write_report(
+        tmp_path,
+        [
+            _report_session_entry("good", "success"),
+            _report_session_entry(
+                "tests",
+                "failed",
+                signatures=["tests(x=2)"],
+                args={"x": 2},
+            ),
+            _report_session_entry(
+                "lint",
+                "failed",
+                reason="old lint failure",
+                duration=9.5,
+            ),
+            _report_session_entry("tidy", "failed"),
+            _report_session_entry("ghost", "failed"),
+        ],
+    )
+    config = _last_failed_config(path, sessions=("tests",))
+    manifest = Manifest(
+        {"good": session_func, "tests": tests, "lint": lint, "tidy": tidy},
+        config,
+    )
+    assert tasks.filter_manifest(manifest, config) is manifest
+
+    (tests_runner,) = (
+        session for session, selected in manifest.list_all_sessions() if selected
+    )
+    results = [sessions.Result(tests_runner, sessions.Status.SUCCESS)]
+
+    assert tasks.create_report(results, config) is results
+
+    report = json.loads(path.read_text(encoding="utf-8"))
+    # The overall result reflects this run's sessions only (they passed).
+    assert report["result"] == 1
+    written = report["sessions"]
+    # This run's fresh result comes first.
+    assert written[0]["signatures"] == ["tests(x=2)"]
+    assert written[0]["result"] == "success"
+    # Failed sessions excluded by -s this time keep their old records, in
+    # old report order; the run session's old failure is replaced.
+    assert [entry["name"] for entry in written[1:]] == ["lint", "tidy"]
+    lint_entry = written[1]
+    assert lint_entry["result"] == "failed"
+    assert lint_entry["reason"] == "old lint failure"
+    assert lint_entry["duration"] == 9.5
+    # Old successes and sessions gone from the Noxfile are not retained.
+    assert all(entry["name"] != "good" for entry in written)
+    assert all(entry["name"] != "ghost" for entry in written)
+
+
+def test_last_failed_create_report_result_reflects_current_run(
+    tmp_path: Path,
+) -> None:
+    path = _write_report(
+        tmp_path,
+        [
+            _report_session_entry("bar", "failed"),
+            _report_session_entry("baz", "failed"),
+        ],
+    )
+    config = _last_failed_config(path, sessions=("bar",))
+    manifest = Manifest({"bar": session_func, "baz": session_func}, config)
+    assert tasks.filter_manifest(manifest, config) is manifest
+
+    (bar_runner,) = (
+        session for session, selected in manifest.list_all_sessions() if selected
+    )
+    results = [sessions.Result(bar_runner, sessions.Status.FAILED)]
+    tasks.create_report(results, config)
+
+    report = json.loads(path.read_text(encoding="utf-8"))
+    # This run failed even though it is only one of the two entries.
+    assert report["result"] == 0
+    assert [entry["name"] for entry in report["sessions"]] == ["bar", "baz"]
+    assert [entry["result"] for entry in report["sessions"]] == [
+        "failed",
+        "failed",
+    ]
+
+
+def test_last_failed_create_report_drops_successes_and_replaced(
+    tmp_path: Path,
+) -> None:
+    bar = _make_session_func([])
+    baz = _make_session_func([])
+    path = _write_report(
+        tmp_path,
+        [
+            _report_session_entry("good", "success"),
+            _report_session_entry("bar", "failed"),
+            _report_session_entry("baz", "failed"),
+            _report_session_entry("ghost", "failed"),
+        ],
+    )
+    config = _last_failed_config(path)
+    manifest = Manifest({"good": session_func, "bar": bar, "baz": baz}, config)
+    assert tasks.filter_manifest(manifest, config) is manifest
+
+    runners = [
+        session for session, selected in manifest.list_all_sessions() if selected
+    ]
+    assert [runner.friendly_name for runner in runners] == ["bar", "baz"]
+    results = [
+        sessions.Result(bar_runner, sessions.Status.SUCCESS) for bar_runner in runners
+    ]
+    tasks.create_report(results, config)
+
+    report = json.loads(path.read_text(encoding="utf-8"))
+    assert report["result"] == 1
+    assert [entry["name"] for entry in report["sessions"]] == ["bar", "baz"]
+    assert {entry["result"] for entry in report["sessions"]} == {"success"}
+
+
 def test_honor_usage_request_noop() -> None:
     config = _options.options.namespace(usage=None)
     manifest = typing.cast("Manifest", {"thing": mock.sentinel.THING})

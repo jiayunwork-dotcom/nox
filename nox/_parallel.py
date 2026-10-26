@@ -363,6 +363,9 @@ def _child_argv(
         "sessions": [_session_selector(session)],
         "keywords": None,
         "tags": None,
+        # The child runs exactly the session it was scheduled; it must not
+        # try to re-select from its freshly-created (empty) temp report.
+        "last_failed": False,
         "parallel": 1,
         "parallel_worker": True,
         "no_dependencies": True,

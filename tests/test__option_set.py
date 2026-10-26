@@ -359,6 +359,7 @@ class TestToArgv:
             ["--force-python", "3.13", "--stop-on-first-error"],
             ["-j", "2", "--allow-parallel"],
             ["-s", "test", "--", "-k", "foo", "--flag"],
+            ["--last-failed", "--report", "results.json"],
         ],
     )
     def test_round_trip(self, args: list[str]) -> None:

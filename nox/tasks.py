@@ -33,7 +33,7 @@ import json
 import os
 import sys
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from colorlog.escape_codes import parse_colors
 
@@ -42,7 +42,11 @@ from nox import _merge, registry
 from nox._resolver import CycleError
 from nox._version import InvalidVersionSpecifier, VersionCheckFailed, check_nox_version
 from nox.logger import logger
-from nox.manifest import WARN_PYTHONS_IGNORED, Manifest
+from nox.manifest import (
+    WARN_PYTHONS_IGNORED,
+    Manifest,
+    _normalized_session_match,
+)
 from nox.sessions import Result, Status, _duration_str, resolve_allow_parallel
 
 if TYPE_CHECKING:
@@ -61,6 +65,16 @@ __all__ = [
     "print_summary",
     "run_manifest",
 ]
+
+
+# Result names as they appear in a ``--report`` file (``Status`` lowercased).
+_REPORT_RESULT_STATUSES: frozenset[str] = frozenset(
+    status.name.lower() for status in Status
+)
+# The statuses --last-failed re-runs; success and skipped are left alone.
+_LAST_FAILED_STATUSES: frozenset[str] = frozenset(
+    (Status.FAILED.name.lower(), Status.ABORTED.name.lower())
+)
 
 
 def __dir__() -> list[str]:
@@ -190,6 +204,85 @@ def discover_manifest(
     return Manifest(functions, global_config, module_docstring)
 
 
+def _report_entry_selector(entry: dict[str, Any]) -> str | None:
+    """Return the identifier uniquely naming a report entry's session.
+
+    The longest serialized signature (e.g. ``test-3.12(x=1)``) is unique even
+    for a session parametrized over both interpreters and arguments, so a
+    single parametrization can be selected without pulling in its siblings.
+    Falls back to the bare name when the entry has no signatures.
+    """
+    signatures = entry.get("signatures")
+    if isinstance(signatures, list):
+        candidates = [s for s in signatures if isinstance(s, str) and s]
+        if candidates:
+            return max(candidates, key=len)
+    name = entry.get("name")
+    return name if isinstance(name, str) and name else None
+
+
+def _load_last_failed_report(
+    global_config: NoxConfig,
+) -> list[dict[str, Any]] | int:
+    """Read and validate the previous ``--report`` for ``--last-failed``.
+
+    Returns the report's session entries, or the exit code ``3`` when
+    ``--report`` is unset, the file cannot be read, or it is not a report
+    written by Nox. Nothing is run and the file is left untouched in those
+    cases.
+    """
+    report_path = global_config.report
+    if report_path is None:
+        logger.error(
+            "--last-failed requires --report to locate the previous run's results."
+        )
+        return 3
+    try:
+        with open(report_path, encoding="utf-8") as report_file:
+            report = json.load(report_file)
+    except FileNotFoundError:
+        logger.error(f"--last-failed: report file not found: {report_path}")
+        return 3
+    except json.JSONDecodeError as err:
+        logger.error(f"--last-failed: {report_path} is not a Nox report: {err}")
+        return 3
+    except OSError as err:
+        logger.error(f"--last-failed: could not read report {report_path}: {err}")
+        return 3
+
+    if not isinstance(report, dict):
+        logger.error(
+            f"--last-failed: {report_path} is not a Nox report"
+            " (expected an object with a 'sessions' list)."
+        )
+        return 3
+    raw_entries = report.get("sessions")
+    if not isinstance(raw_entries, list):
+        logger.error(
+            f"--last-failed: {report_path} is not a Nox report"
+            " (expected an object with a 'sessions' list)."
+        )
+        return 3
+
+    entries: list[dict[str, Any]] = []
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            logger.error(
+                f"--last-failed: {report_path} is not a Nox report"
+                " (found a session entry that is not an object)."
+            )
+            return 3
+        result = entry.get("result")
+        if not isinstance(result, str) or result not in _REPORT_RESULT_STATUSES:
+            logger.error(
+                f"--last-failed: {report_path} is not a Nox report"
+                " (found a session entry without a valid result)."
+            )
+            return 3
+        entries.append(entry)
+    return entries
+
+
 def filter_manifest(manifest: Manifest, global_config: NoxConfig) -> Manifest | int:
     """Filter the manifest according to the provided configuration.
 
@@ -207,11 +300,57 @@ def filter_manifest(manifest: Manifest, global_config: NoxConfig) -> Manifest | 
         logger.error(f"No sessions found in {global_config.noxfile}.")
         return 3
 
+    # --last-failed selects from the previous --report instead of the default
+    # set: only sessions that failed or aborted then are re-run, regardless of
+    # their default flag; their ``requires=`` prerequisites are added later as
+    # usual. An unusable report is a fatal error before anything runs and the
+    # report file is left untouched.
+    if global_config.last_failed:
+        previous_entries = _load_last_failed_report(global_config)
+        if isinstance(previous_entries, int):
+            return previous_entries
+        global_config.last_failed_entries = previous_entries
+
+        rerun_selectors = [
+            selector
+            for entry in previous_entries
+            if entry["result"] in _LAST_FAILED_STATUSES
+            if (selector := _report_entry_selector(entry)) is not None
+        ]
+        manifest.filter_by_last_failed(rerun_selectors)
+
+        # Record the previously-failed selectors that still match a session in
+        # this Noxfile; create_report carries these forward when they aren't
+        # re-run now, while entries for sessions that no longer exist are
+        # dropped for good.
+        matched_runners = [
+            session for session, selected in manifest.list_all_sessions() if selected
+        ]
+        global_config.last_failed_known_selectors = frozenset(
+            selector
+            for selector in rerun_selectors
+            if any(
+                _normalized_session_match(selector, session)
+                for session in matched_runners
+            )
+        )
+
+        # An explicit -s narrows the previous failures (an intersection);
+        # -p/-t/-k are intersected by their regular filters below. This can
+        # raise KeyError if a specified session does not exist.
+        if global_config.sessions is not None:
+            try:
+                manifest.filter_by_name(global_config.sessions)
+            except KeyError as exc:
+                logger.error("Error while collecting sessions.")
+                logger.error(exc.args[0])
+                return 3
+
     # Filter by the name of any explicit sessions.
     # This can raise KeyError if a specified session does not exist;
     # log this if it happens. The sessions does not come from the Noxfile
     # if keywords is not empty or tags are supplied.
-    if global_config.tags is None and not global_config.keywords:
+    elif global_config.tags is None and not global_config.keywords:
         if global_config.sessions is None:
             manifest.filter_by_default()
         else:
@@ -223,6 +362,12 @@ def filter_manifest(manifest: Manifest, global_config: NoxConfig) -> Manifest | 
                 return 3
 
     if not manifest and not global_config.list_sessions:
+        if global_config.last_failed:
+            logger.info(
+                "No failed or aborted sessions in the previous report; not"
+                " re-running any sessions."
+            )
+            return 0
         print("No sessions selected. Please select a session with -s <session name>.\n")
         _produce_listing(manifest, global_config)
         return 0
@@ -499,10 +644,48 @@ def print_summary(
     return results
 
 
+def _carry_forward_last_failed(
+    results: Sequence[Result], global_config: NoxConfig
+) -> list[dict[str, Any]]:
+    """Previous failures not re-run this time keep their old report entries.
+
+    The rewritten --report lists this run's sessions first with their fresh
+    results. A previously failed/aborted session that still exists in the
+    Noxfile but was excluded from this run (e.g. by ``-s``/``-k``/``-t``) is
+    appended unchanged, so a later ``--last-failed`` can still find it.
+    Entries for sessions that succeeded or were skipped previously, sessions
+    re-run this time, and sessions that no longer exist in the Noxfile are
+    not carried over.
+    """
+    previous_entries = global_config.last_failed_entries
+    known_selectors = global_config.last_failed_known_selectors or frozenset()
+    if not previous_entries:
+        return []
+
+    carried: list[dict[str, Any]] = []
+    for entry in previous_entries:
+        if entry["result"] not in _LAST_FAILED_STATUSES:
+            continue
+        selector = _report_entry_selector(entry)
+        if selector is None or selector not in known_selectors:
+            continue
+        if any(
+            _normalized_session_match(selector, result.session) for result in results
+        ):
+            continue
+        carried.append(entry)
+    return carried
+
+
 def create_report(
     results: Sequence_Results_T, global_config: NoxConfig
 ) -> Sequence_Results_T:
     """Write a report to the location designated in the config, if any.
+
+    With ``--last-failed`` the report is the previous one rewritten in place:
+    this run's results come first, followed by the old records of any
+    failed/aborted sessions that were not re-run this time. The overall
+    result reflects this run's sessions only.
 
     Args:
         results (Sequence[~nox.sessions.Result]): A list of Result objects
@@ -516,12 +699,16 @@ def create_report(
     if global_config.report is None:
         return results
 
+    entries = [result.serialize() for result in results]
+    if global_config.last_failed:
+        entries.extend(_carry_forward_last_failed(results, global_config))
+
     # Write the JSON report.
     with open(global_config.report, "w", encoding="utf-8") as report_file:
         json.dump(
             {
                 "result": int(all(results)),
-                "sessions": [result.serialize() for result in results],
+                "sessions": entries,
             },
             report_file,
             indent=2,
